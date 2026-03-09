@@ -392,3 +392,4 @@ build
 .idea/
 .vscode
 .claude/
+.quinoa/
