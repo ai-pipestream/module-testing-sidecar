@@ -1,66 +1,104 @@
+import org.apache.tools.ant.filters.ReplaceTokens
+import org.gradle.plugins.signing.Sign
+
 plugins {
     alias(libs.plugins.java)
     alias(libs.plugins.quarkus)
     alias(libs.plugins.maven.publish)
     id 'signing'
-    id 'com.gradleup.nmcp' version '1.2.0'
+    alias(libs.plugins.nmcp.single)
+    alias(libs.plugins.axion.release)
+    alias(libs.plugins.proto.toolchain)
 }
 
-def pipelineBomVersion = findProperty('pipelineBomVersion') ?: '0.1.2-SNAPSHOT'
+def pipestreamBomVersion = findProperty('pipestreamBomVersion')
+
+scmVersion {
+    tag {
+        prefix = 'v'
+        initialVersion { config, position -> '0.0.1' }
+    }
+    checks {
+        uncommittedChanges = false
+        aheadOfRemote = false
+        snapshotDependencies = false
+    }
+}
+
+pipestreamProtos {
+    sourceMode = 'git-proto-workspace'
+    gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
+    gitRef = "main"
+    generateMutiny = true
+    generateDescriptors = true
+
+    modules {
+        register("common")
+        register("config")
+        register("pipeline-module")
+        register("repo")
+        register("testing-harness")
+    }
+}
 
 dependencies {
-    implementation 'io.quarkus:quarkus-container-image-docker'
-    // Import pipeline BOM to align all managed versions
-    implementation platform("ai.pipestream:pipeline-bom:${pipelineBomVersion}")
-
-    // Quarkus dependencies
-    implementation libs.quarkus.grpc
-    implementation libs.quarkus.arc
-    implementation 'io.quarkus:quarkus-grpc'
-    implementation 'io.quarkus:quarkus-arc'
+    // Import pipestream BOM to align all managed versions
+    implementation platform("ai.pipestream:pipestream-bom:${pipestreamBomVersion}")
 
     // Core Quarkus dependencies
+    implementation 'io.quarkus:quarkus-arc'
+    implementation 'io.quarkus:quarkus-grpc'
     implementation 'io.quarkus:quarkus-rest'
     implementation 'io.quarkus:quarkus-rest-jackson'
     implementation 'io.quarkus:quarkus-smallrye-health'
     implementation 'io.quarkus:quarkus-smallrye-openapi'
+    implementation 'io.quarkus:quarkus-swagger-ui'
+    implementation 'io.quarkus:quarkus-smallrye-stork'
+    implementation libs.quarkus.quinoa
+    implementation 'io.quarkus:quarkus-container-image-docker'
 
     // Service Discovery dependencies for Consul
-    implementation 'io.quarkus:quarkus-smallrye-stork'
     implementation 'io.smallrye.stork:stork-service-discovery-consul'
     implementation 'io.smallrye.reactive:smallrye-mutiny-vertx-consul-client'
 
     // Micrometer metrics
-    implementation 'io.quarkus:quarkus-micrometer'
-    implementation 'io.micrometer:micrometer-registry-prometheus'
+    implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
     implementation 'io.grpc:grpc-services'
 
+    // Pipestream platform libraries
+    implementation 'ai.pipestream:pipestream-quarkus-devservices'
+    implementation 'ai.pipestream:quarkus-dynamic-grpc'
+    implementation 'ai.pipestream:pipestream-service-registration'
+    implementation 'ai.pipestream:pipestream-server'
+
+    // Protobuf JSON utilities
+    implementation 'com.google.protobuf:protobuf-java-util'
+
+    // Testing
+    testImplementation platform("ai.pipestream:pipestream-bom:${pipestreamBomVersion}")
     testImplementation 'io.quarkus:quarkus-junit5'
     testImplementation 'io.rest-assured:rest-assured'
-    testImplementation libs.pipestream.grpc.wiremock
-    // Pipestream libraries - versions managed entirely by the BOM/catalog
-    implementation libs.pipestream.compose.devservices
-    implementation libs.pipestream.grpc.stubs
-    implementation libs.pipestream.commons
-    implementation libs.pipestream.api
-    implementation libs.pipestream.data.util
-    implementation libs.pipestream.dynamic.grpc
-    implementation libs.pipestream.dynamic.grpc.registration.clients
+    testImplementation libs.hamcrest.core
+    testImplementation libs.hamcrest.library
 
-
+    runtimeOnly libs.quarkus.logging.manager
 }
 
-group 'io.pipeline.module'
-version "${pipelineBomVersion}"
+group = 'ai.pipestream.module'
+version = "${scmVersion.version}"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21
     targetCompatibility = JavaVersion.VERSION_21
+    withJavadocJar()
+    withSourcesJar()
 }
 
 test {
     systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
+    jvmArgs = ["-Xmx4g", "-XX:MaxMetaspaceSize=512m", "--add-opens", "java.base/java.lang=ALL-UNNAMED", "--add-opens", "java.base/java.lang.invoke=ALL-UNNAMED"]
 }
+
 compileJava {
     options.encoding = 'UTF-8'
     options.compilerArgs << '-parameters'
@@ -70,66 +108,80 @@ compileTestJava {
     options.encoding = 'UTF-8'
 }
 
-// Publishing configuration
+tasks.withType(Javadoc).configureEach { task ->
+    def opts = task.options
+    opts.encoding = 'UTF-8'
+    opts.charSet = 'UTF-8'
+    opts.locale = 'en'
+    opts.addStringOption('Xdoclint:-missing', '-quiet')
+    task.exclude('**/internal/**', '**/impl/**', '**/test/**')
+}
+
+processResources {
+    filesMatching('**/*.properties') {
+        filter(ReplaceTokens, tokens: [
+            version: project.version.toString()
+        ])
+    }
+}
+
+processTestResources {
+    filesMatching('**/*.properties') {
+        filter(ReplaceTokens, tokens: [
+            version: project.version.toString()
+        ])
+    }
+}
+
 publishing {
     publications {
-        maven(MavenPublication) {
+        create('maven', MavenPublication) {
             from components.java
-            artifactId = 'module-pipeline-probe'
+            artifactId = 'module-testing-sidecar'
             pom {
-                name = 'Module Pipeline Probe'
-                description = 'Live testing and observation service for pipeline data streams'
-                url = 'https://github.com/ai-pipestream/module-pipeline-probe'
+                name.set('Module Testing Sidecar')
+                description.set('REST and gRPC service for directly testing modules with repository or uploaded content')
+                url.set('https://github.com/ai-pipestream/module-testing-sidecar')
                 licenses {
                     license {
                         name.set('MIT License')
                         url.set('https://opensource.org/licenses/MIT')
                     }
                 }
-
                 developers {
                     developer {
                         id.set('krickert')
                         name.set('Pipestream Platform Team')
                     }
                 }
-
                 scm {
-                    connection.set('scm:git:git://github.com/ai-pipestream/module-pipeline-probe.git')
-                    developerConnection.set('scm:git:ssh://github.com/ai-pipestream/module-pipeline-probe.git')
-                    url.set('https://github.com/ai-pipestream/module-pipeline-probe')
+                    connection.set('scm:git:git://github.com/ai-pipestream/module-testing-sidecar.git')
+                    developerConnection.set('scm:git:ssh://github.com/ai-pipestream/module-testing-sidecar.git')
+                    url.set('https://github.com/ai-pipestream/module-testing-sidecar')
                 }
             }
         }
     }
 
-
     repositories {
-        // Publish to Maven Local for development
         mavenLocal()
 
-        // Publish to GitHub Packages when credentials are available (e.g. CI)
-        def githubToken = providers.environmentVariable("GITHUB_TOKEN")
-        if (githubToken.isPresent()) {
+        if (System.getenv("GITHUB_ACTOR") != null) {
             maven {
                 name = "GitHubPackages"
-                url = uri("https://maven.pkg.github.com/ai-pipestream/module-parser")
+                url = uri("https://maven.pkg.github.com/ai-pipestream/module-testing-sidecar")
                 credentials {
-                    username = providers.environmentVariable("GITHUB_ACTOR").getOrElse("github-actions")
-                    password = githubToken.get()
-                }
-                mavenContent {
-                    releasesOnly()
+                    username = System.getenv("GITHUB_ACTOR")
+                    password = System.getenv("GITHUB_TOKEN")
                 }
             }
         }
     }
 }
 
-// Signing configuration for Maven Central
 signing {
-    def signingKey = System.getenv("GPG_SIGNING_KEY")
-    def signingPassword = System.getenv("GPG_SIGNING_PASSPHRASE")
+    def signingKey = System.getenv("GPG_PRIVATE_KEY")
+    def signingPassword = System.getenv("GPG_PASSPHRASE")
 
     if (signingKey && signingPassword) {
         useInMemoryPgpKeys(signingKey, signingPassword)
@@ -137,7 +189,13 @@ signing {
     }
 }
 
-// Maven Central publishing via nmcp plugin
+afterEvaluate {
+    tasks.matching { it.name.startsWith("nmcpZipAllPublications") || it.name.startsWith("nmcpPublishAllPublicationsToCentralPortal") }
+        .configureEach { nmcpTask ->
+            nmcpTask.dependsOn(tasks.withType(Sign))
+        }
+}
+
 nmcp {
     publishAllPublicationsToCentralPortal {
         username = providers.environmentVariable("MAVEN_CENTRAL_USERNAME")

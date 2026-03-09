@@ -1,0 +1,263 @@
+package ai.pipestream.module.pipelineprobe;
+
+import ai.pipestream.testing.harness.v1.RepositoryInput;
+import ai.pipestream.testing.harness.v1.RunModuleTestRequest;
+import ai.pipestream.testing.harness.v1.RunModuleTestResponse;
+import ai.pipestream.testing.harness.v1.ServiceContext;
+import ai.pipestream.testing.harness.v1.UploadInput;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Struct.Builder;
+import com.google.protobuf.util.JsonFormat;
+import com.google.protobuf.ByteString;
+import io.smallrye.mutiny.Uni;
+import io.quarkus.grpc.GrpcService;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DefaultValue;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.QueryParam;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import org.jboss.logging.Logger;
+import org.jboss.resteasy.reactive.RestForm;
+import org.jboss.resteasy.reactive.server.ServerExceptionMapper;
+import org.jboss.resteasy.reactive.multipart.FileUpload;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * REST resource for the module-testing-sidecar.
+ */
+@Path("/test-sidecar/v1")
+@Produces(MediaType.APPLICATION_JSON)
+public class ModuleTestingSidecarResource {
+
+    private static final Logger LOG = Logger.getLogger(ModuleTestingSidecarResource.class);
+
+    @Inject
+    @GrpcService
+    ModuleTestingSidecarServiceImpl testingService;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @GET
+    @Path("/targets")
+    public Uni<List<ModuleTestingSidecarModels.ModuleTargetInfo>> listTargets(
+            @QueryParam("parserOnly") @DefaultValue("false") boolean parserOnly
+    ) {
+        return testingService.listTargets(parserOnly);
+    }
+
+    @GET
+    @Path("/repository/documents")
+    public Uni<ModuleTestingSidecarModels.RepositoryDocumentsPage> listRepositoryDocuments(
+            @QueryParam("drive") String drive,
+            @QueryParam("connectorId") String connectorId,
+            @QueryParam("limit") @DefaultValue("50") int limit,
+            @QueryParam("continuationToken") String continuationToken
+    ) {
+        return testingService.listRepositoryDocuments(drive, connectorId, limit, continuationToken);
+    }
+
+    @POST
+    @Path("/run/repository")
+    @Consumes(MediaType.APPLICATION_JSON)
+    public Uni<RunModuleTestResponse> runRepository(RunRepositoryRequest request) {
+        return testingService.runModuleTest(buildRunRequestFromRepositoryRequest(request));
+    }
+
+    @POST
+    @Path("/run/upload")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    public Uni<RunModuleTestResponse> runUpload(
+            @RestForm("moduleName") String moduleName,
+            @RestForm("accountId") String accountId,
+            @RestForm("includeOutputDoc") @DefaultValue("false") boolean includeOutputDoc,
+            @RestForm("moduleConfigJson") String moduleConfigJson,
+            @RestForm("pipelineName") String pipelineName,
+            @RestForm("pipeStepName") String pipeStepName,
+            @RestForm("streamId") String streamId,
+            @RestForm("currentHopNumber") long currentHopNumber,
+            @RestForm("contextParamsJson") String contextParamsJson,
+            @RestForm("file") FileUpload file
+    ) {
+        return Uni.createFrom().item(() -> {
+                    byte[] fileBytes = readUploadedFile(file);
+                    return buildRunRequestFromUpload(
+                            moduleName,
+                            accountId,
+                            includeOutputDoc,
+                            parseStruct(moduleConfigJson),
+                            pipelineName,
+                            pipeStepName,
+                            streamId,
+                            currentHopNumber,
+                            parseContextParams(contextParamsJson),
+                            file,
+                            fileBytes
+                    );
+                })
+                .flatMap(testingService::runModuleTest);
+    }
+
+    private RunModuleTestRequest buildRunRequestFromRepositoryRequest(RunRepositoryRequest request) {
+        if (request == null || request.moduleName() == null || request.moduleName().isBlank()) {
+            throw new IllegalArgumentException("moduleName is required");
+        }
+        if (request.repositoryNodeId() == null || request.repositoryNodeId().isBlank()) {
+            throw new IllegalArgumentException("repositoryNodeId is required");
+        }
+
+        return RunModuleTestRequest.newBuilder()
+                .setModuleName(request.moduleName())
+                .setModuleConfig(parseStruct(request.moduleConfig()))
+                .setIncludeOutputDoc(request.includeOutputDoc())
+                .setAccountId(resolveText(request.accountId(), ""))
+                .setContext(buildContext(
+                    request.pipelineName(),
+                    request.pipeStepName(),
+                    request.streamId(),
+                    request.currentHopNumber(),
+                    request.contextParams()
+                ))
+                .setRepository(RepositoryInput.newBuilder()
+                    .setRepositoryNodeId(request.repositoryNodeId())
+                    .setDrive(resolveText(request.drive(), ""))
+                    .setHydrateBlobFromStorage(request.hydrateBlobFromStorage())
+                    .build())
+                .build();
+    }
+
+    private RunModuleTestRequest buildRunRequestFromUpload(
+            String moduleName,
+            String accountId,
+            boolean includeOutputDoc,
+            Struct moduleConfig,
+            String pipelineName,
+            String pipeStepName,
+            String streamId,
+            long currentHopNumber,
+            Map<String, String> contextParams,
+            FileUpload file,
+            byte[] fileBytes
+    ) {
+        if (moduleName == null || moduleName.isBlank()) {
+            throw new IllegalArgumentException("moduleName is required");
+        }
+        if (file == null || file.size() <= 0) {
+            throw new IllegalArgumentException("file is required for upload tests");
+        }
+
+        return RunModuleTestRequest.newBuilder()
+                .setModuleName(moduleName)
+                .setModuleConfig(moduleConfig == null ? Struct.getDefaultInstance() : moduleConfig)
+                .setIncludeOutputDoc(includeOutputDoc)
+                .setAccountId(resolveText(accountId, ""))
+                .setContext(buildContext(
+                        pipelineName,
+                        pipeStepName,
+                        streamId,
+                        currentHopNumber,
+                        contextParams
+                ))
+                .setUpload(UploadInput.newBuilder()
+                        .setFilename(file.fileName())
+                        .setMimeType(resolveText(file.contentType(), "application/octet-stream"))
+                        .setFileData(ByteString.copyFrom(fileBytes))
+                        .build())
+                .build();
+    }
+
+    private ServiceContext buildContext(
+            String pipelineName,
+            String pipeStepName,
+            String streamId,
+            long currentHopNumber,
+            Map<String, String> contextParams
+    ) {
+        return ServiceContext.newBuilder()
+                .setPipelineName(resolveText(pipelineName, "module-testing-sidecar"))
+                .setPipeStepName(resolveText(pipeStepName, "module-testing-step"))
+                .setStreamId(resolveText(streamId, ""))
+                .setCurrentHopNumber(currentHopNumber <= 0 ? 1 : currentHopNumber)
+                .putAllContextParams(contextParams == null ? Collections.emptyMap() : contextParams)
+                .build();
+    }
+
+    private Struct parseStruct(String json) {
+        if (json == null || json.isBlank()) {
+            return Struct.getDefaultInstance();
+        }
+
+        Builder structBuilder = Struct.newBuilder();
+        try {
+            JsonFormat.parser().merge(json, structBuilder);
+            return structBuilder.build();
+        } catch (Exception e) {
+            LOG.error("Invalid moduleConfig JSON", e);
+            throw new IllegalArgumentException("moduleConfig must be valid JSON object");
+        }
+    }
+
+    private Map<String, String> parseContextParams(String contextParamsJson) {
+        if (contextParamsJson == null || contextParamsJson.isBlank()) {
+            return Collections.emptyMap();
+        }
+
+        try {
+            return objectMapper.readValue(contextParamsJson, new TypeReference<Map<String, String>>() {});
+        } catch (Exception e) {
+            LOG.error("Invalid contextParamsJson", e);
+            throw new IllegalArgumentException("contextParamsJson must be valid JSON map");
+        }
+    }
+
+    private byte[] readUploadedFile(FileUpload file) {
+        if (file == null || file.uploadedFile() == null) {
+            throw new IllegalArgumentException("No file uploaded");
+        }
+        try {
+            File uploadedFile = file.uploadedFile().toFile();
+            return Files.readAllBytes(uploadedFile.toPath());
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Failed to read uploaded file", e);
+        }
+    }
+
+    private String resolveText(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    @ServerExceptionMapper
+    public Response mapValidationErrors(IllegalArgumentException e) {
+        return Response.status(Response.Status.BAD_REQUEST)
+                .entity(Map.of("error", e.getMessage()))
+                .build();
+    }
+
+    public record RunRepositoryRequest(
+            String moduleName,
+            String repositoryNodeId,
+            String drive,
+            boolean hydrateBlobFromStorage,
+            String moduleConfig,
+            boolean includeOutputDoc,
+            String accountId,
+            String pipelineName,
+            String pipeStepName,
+            String streamId,
+            long currentHopNumber,
+            Map<String, String> contextParams
+    ) {
+    }
+}

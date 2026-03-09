@@ -1,6 +1,6 @@
 package ai.pipestream.module.pipelineprobe;
 
-import ai.pipestream.data.module.PipeStepProcessor;
+import ai.pipestream.data.module.v1.PipeStepProcessorService;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.junit.QuarkusTest;
 
@@ -11,10 +11,10 @@ import io.quarkus.test.junit.QuarkusTest;
 class TestProcessorUnitTest extends TestProcessorTestBase {
 
     @GrpcClient
-    PipeStepProcessor pipeStepProcessor;
+    PipeStepProcessorService pipeStepProcessorService;
 
     @Override
-    protected PipeStepProcessor getTestProcessor() {
-        return pipeStepProcessor;
+    protected PipeStepProcessorService getTestProcessor() {
+        return pipeStepProcessorService;
     }
 }

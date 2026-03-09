@@ -4,9 +4,9 @@ import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.SearchMetadata;
-import ai.pipestream.data.module.ProcessConfiguration;
-import ai.pipestream.data.module.ModuleProcessRequest;
-import ai.pipestream.data.module.ServiceMetadata;
+import ai.pipestream.data.v1.ProcessConfiguration;
+import ai.pipestream.data.module.v1.ProcessDataRequest;
+import ai.pipestream.data.module.v1.ServiceMetadata;
 
 import java.util.UUID;
 
@@ -15,7 +15,7 @@ import java.util.UUID;
  * This makes it easier to test different scenarios with the test module.
  */
 public class TestProcessorHelper {
-    
+
     /**
      * Builder for creating test documents with various configurations.
      */
@@ -24,37 +24,37 @@ public class TestProcessorHelper {
         private String title;
         private String body;
         private Struct.Builder customData = Struct.newBuilder();
-        
+
         public TestDocumentBuilder withDocId(String docId) {
             this.id = docId;
             return this;
         }
-        
+
         public TestDocumentBuilder withTitle(String title) {
             this.title = title;
             return this;
         }
-        
+
         public TestDocumentBuilder withBody(String body) {
             this.body = body;
             return this;
         }
-        
+
         public TestDocumentBuilder withCustomField(String key, String value) {
             customData.putFields(key, Value.newBuilder().setStringValue(value).build());
             return this;
         }
-        
+
         public TestDocumentBuilder withCustomField(String key, boolean value) {
             customData.putFields(key, Value.newBuilder().setBoolValue(value).build());
             return this;
         }
-        
+
         public TestDocumentBuilder withCustomField(String key, double value) {
             customData.putFields(key, Value.newBuilder().setNumberValue(value).build());
             return this;
         }
-        
+
         public PipeDoc build() {
             PipeDoc.Builder builder = PipeDoc.newBuilder().setDocId(id);
 
@@ -77,7 +77,7 @@ public class TestProcessorHelper {
             return builder.build();
         }
     }
-    
+
     /**
      * Builder for creating test requests with various configurations.
      */
@@ -88,77 +88,77 @@ public class TestProcessorHelper {
         private String streamId = "test-stream-1";
         private long hopNumber = 1;
         private Struct.Builder configBuilder = Struct.newBuilder();
-        
+
         public TestRequestBuilder withDocument(PipeDoc document) {
             this.document = document;
             return this;
         }
-        
+
         public TestRequestBuilder withPipelineName(String pipelineName) {
             this.pipelineName = pipelineName;
             return this;
         }
-        
+
         public TestRequestBuilder withStepName(String stepName) {
             this.stepName = stepName;
             return this;
         }
-        
+
         public TestRequestBuilder withStreamId(String streamId) {
             this.streamId = streamId;
             return this;
         }
-        
+
         public TestRequestBuilder withHopNumber(long hopNumber) {
             this.hopNumber = hopNumber;
             return this;
         }
-        
+
         public TestRequestBuilder withMode(ProcessingMode mode) {
             configBuilder.putFields("mode", Value.newBuilder().setStringValue(mode.name().toLowerCase()).build());
             return this;
         }
-        
+
         public TestRequestBuilder withSchemaValidation(boolean enabled) {
             configBuilder.putFields("requireSchema", Value.newBuilder().setBoolValue(enabled).build());
             return this;
         }
-        
+
         public TestRequestBuilder withAddMetadata(boolean enabled) {
             configBuilder.putFields("addMetadata", Value.newBuilder().setBoolValue(enabled).build());
             return this;
         }
-        
+
         public TestRequestBuilder withSimulateError(boolean enabled) {
             configBuilder.putFields("simulateError", Value.newBuilder().setBoolValue(enabled).build());
             return this;
         }
-        
-        public ModuleProcessRequest build() {
-            ModuleProcessRequest.Builder builder = ModuleProcessRequest.newBuilder();
-            
+
+        public ProcessDataRequest build() {
+            ProcessDataRequest.Builder builder = ProcessDataRequest.newBuilder();
+
             if (document != null) {
                 builder.setDocument(document);
             }
-            
+
             builder.setMetadata(ServiceMetadata.newBuilder()
                     .setPipelineName(pipelineName)
                     .setPipeStepName(stepName)
                     .setStreamId(streamId)
                     .setCurrentHopNumber(hopNumber)
                     .build());
-            
+
             Struct config = configBuilder.build();
             if (config.getFieldsCount() > 0) {
                 builder.setConfig(ProcessConfiguration.newBuilder()
-                        .setCustomJsonConfig(config)
+                        .setJsonConfig(config)
                         .build());
             }
-            
+
             return builder.build();
         }
     }
-    
+
     /**
      * Processing modes supported by the test processor.
      */
@@ -167,21 +167,21 @@ public class TestProcessorHelper {
         VALIDATE,  // Schema validation mode - validates required fields
         TRANSFORM  // Transform mode - can modify document content
     }
-    
+
     /**
      * Creates a builder for test documents.
      */
     public static TestDocumentBuilder documentBuilder() {
         return new TestDocumentBuilder();
     }
-    
+
     /**
      * Creates a builder for test requests.
      */
     public static TestRequestBuilder requestBuilder() {
         return new TestRequestBuilder();
     }
-    
+
     /**
      * Creates a valid document with all required fields for schema validation.
      */
@@ -192,7 +192,7 @@ public class TestProcessorHelper {
                 .withCustomField("source", "test-helper")
                 .build();
     }
-    
+
     /**
      * Creates a document missing the title field (invalid for schema validation).
      */
@@ -202,7 +202,7 @@ public class TestProcessorHelper {
                 .withCustomField("source", "test-helper")
                 .build();
     }
-    
+
     /**
      * Creates a document missing the body field (invalid for schema validation).
      */
@@ -212,30 +212,30 @@ public class TestProcessorHelper {
                 .withCustomField("source", "test-helper")
                 .build();
     }
-    
+
     /**
      * Creates a simple test request with a valid document.
      */
-    public static ModuleProcessRequest createSimpleRequest() {
+    public static ProcessDataRequest createSimpleRequest() {
         return requestBuilder()
                 .withDocument(createValidDocument())
                 .build();
     }
-    
+
     /**
      * Creates a request configured for schema validation mode.
      */
-    public static ModuleProcessRequest createSchemaValidationRequest(PipeDoc document) {
+    public static ProcessDataRequest createSchemaValidationRequest(PipeDoc document) {
         return requestBuilder()
                 .withDocument(document)
                 .withMode(ProcessingMode.VALIDATE)
                 .build();
     }
-    
+
     /**
      * Creates a request configured to simulate an error.
      */
-    public static ModuleProcessRequest createErrorRequest() {
+    public static ProcessDataRequest createErrorRequest() {
         return requestBuilder()
                 .withDocument(createValidDocument())
                 .withSimulateError(true)

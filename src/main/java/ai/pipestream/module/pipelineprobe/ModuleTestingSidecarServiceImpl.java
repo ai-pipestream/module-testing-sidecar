@@ -1,0 +1,515 @@
+package ai.pipestream.module.pipelineprobe;
+
+import ai.pipestream.data.module.v1.CapabilityType;
+import ai.pipestream.data.module.v1.GetServiceRegistrationRequest;
+import ai.pipestream.data.module.v1.GetServiceRegistrationResponse;
+import ai.pipestream.data.module.v1.MutinyPipeStepProcessorServiceGrpc;
+import ai.pipestream.data.module.v1.ProcessDataRequest;
+import ai.pipestream.data.module.v1.ProcessDataResponse;
+import ai.pipestream.data.module.v1.ServiceMetadata;
+import ai.pipestream.data.v1.Blob;
+import ai.pipestream.data.v1.BlobBag;
+import ai.pipestream.data.v1.ProcessConfiguration;
+import ai.pipestream.data.v1.PipeDoc;
+import ai.pipestream.data.v1.SearchMetadata;
+import ai.pipestream.platform.registration.v1.GetModuleResponse;
+import ai.pipestream.platform.registration.v1.ListPlatformModulesRequest;
+import ai.pipestream.platform.registration.v1.ListPlatformModulesResponse;
+import ai.pipestream.platform.registration.v1.MutinyPlatformRegistrationServiceGrpc;
+import ai.pipestream.repository.pipedoc.v1.GetBlobRequest;
+import ai.pipestream.repository.pipedoc.v1.GetBlobResponse;
+import ai.pipestream.repository.pipedoc.v1.GetPipeDocRequest;
+import ai.pipestream.repository.pipedoc.v1.GetPipeDocResponse;
+import ai.pipestream.repository.pipedoc.v1.ListPipeDocsRequest;
+import ai.pipestream.repository.pipedoc.v1.ListPipeDocsResponse;
+import ai.pipestream.repository.pipedoc.v1.MutinyPipeDocServiceGrpc;
+import ai.pipestream.repository.pipedoc.v1.PipeDocMetadata;
+import ai.pipestream.testing.harness.v1.ModuleTestingSidecarService;
+import ai.pipestream.testing.harness.v1.RepositoryInput;
+import ai.pipestream.testing.harness.v1.RunModuleTestRequest;
+import ai.pipestream.testing.harness.v1.RunModuleTestResponse;
+import ai.pipestream.testing.harness.v1.ServiceContext;
+import ai.pipestream.testing.harness.v1.UploadInput;
+import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Timestamp;
+import com.google.protobuf.Value;
+import io.quarkus.grpc.GrpcService;
+import io.smallrye.mutiny.Multi;
+import io.smallrye.mutiny.Uni;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.jboss.logging.Logger;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+/**
+ * gRPC-backed service implementation for module-testing-sidecar.
+ */
+@GrpcService
+@Singleton
+public class ModuleTestingSidecarServiceImpl implements ModuleTestingSidecarService {
+
+    private static final Logger LOG = Logger.getLogger(ModuleTestingSidecarServiceImpl.class);
+    private static final Set<CapabilityType> PARSER_CAPABILITIES = Set.of(CapabilityType.CAPABILITY_TYPE_PARSER);
+
+    @Inject
+    DynamicGrpcClientFactory grpcClientFactory;
+
+    @ConfigProperty(name = "module.testing.sidecar.platform-registration-service", defaultValue = "platform-registration")
+    String platformRegistrationServiceName;
+
+    @ConfigProperty(name = "module.testing.sidecar.repository-service", defaultValue = "repository")
+    String repositoryServiceName;
+
+    @ConfigProperty(name = "module.testing.sidecar.default-pipeline-name", defaultValue = "module-testing-sidecar")
+    String defaultPipelineName;
+
+    @ConfigProperty(name = "module.testing.sidecar.default-step-name", defaultValue = "module-testing-step")
+    String defaultStepName;
+
+    @Override
+    public Uni<RunModuleTestResponse> runModuleTest(RunModuleTestRequest request) {
+        long startedAtMs = System.currentTimeMillis();
+        Timestamp startedAt = toTimestamp(startedAtMs);
+
+        return validateRequest(request)
+            .chain(ignore -> validateUploadCapability(request))
+            .chain(ignore -> resolveInputDocument(request))
+            .flatMap(document -> executeModuleCall(request, document))
+            .map(response -> buildRunResponse(request, response, startedAtMs, startedAt))
+            .onFailure().recoverWithItem(throwable ->
+                buildRunResponseFromFailure(request == null ? "unknown" : request.getModuleName(), throwable, startedAtMs, startedAt)
+            );
+    }
+
+    public Uni<List<ModuleTestingSidecarModels.ModuleTargetInfo>> listTargets(boolean parserOnly) {
+        return listModules()
+            .onItem().transformToMulti(modules -> Multi.createFrom().iterable(modules))
+            .onItem().transformToUniAndMerge(this::resolveModuleTarget)
+            .collect().asList()
+            .map(targets -> {
+                if (!parserOnly) {
+                    return targets;
+                }
+                return targets.stream()
+                    .filter(ModuleTestingSidecarModels.ModuleTargetInfo::parser)
+                    .collect(Collectors.toList());
+            });
+    }
+
+    public Uni<ModuleTestingSidecarModels.RepositoryDocumentsPage> listRepositoryDocuments(
+            String drive,
+            String connectorId,
+            int limit,
+            String continuationToken
+    ) {
+        int resolvedLimit = (limit <= 0 || limit > 200) ? 50 : limit;
+
+        return grpcClientFactory.getClient(repositoryServiceName, MutinyPipeDocServiceGrpc::newMutinyStub)
+            .flatMap(stub -> {
+                ListPipeDocsRequest.Builder requestBuilder = ListPipeDocsRequest.newBuilder()
+                    .setLimit(resolvedLimit);
+
+                if (drive != null && !drive.isBlank()) {
+                    requestBuilder.setDrive(drive);
+                }
+
+                if (connectorId != null && !connectorId.isBlank()) {
+                    requestBuilder.setConnectorId(connectorId);
+                }
+
+                if (continuationToken != null && !continuationToken.isBlank()) {
+                    requestBuilder.setContinuationToken(continuationToken);
+                }
+
+                return stub.listPipeDocs(requestBuilder.build());
+            })
+            .map(this::toRepositoryDocumentsPage)
+            .onFailure().recoverWithItem(failure ->
+                new ModuleTestingSidecarModels.RepositoryDocumentsPage(List.of(), "", 0));
+    }
+
+    public Uni<List<GetModuleResponse>> listModules() {
+        return grpcClientFactory.getClient(platformRegistrationServiceName, MutinyPlatformRegistrationServiceGrpc::newMutinyStub)
+            .flatMap(stub -> stub.listPlatformModules(ListPlatformModulesRequest.getDefaultInstance()))
+            .map(ListPlatformModulesResponse::getModulesList);
+    }
+
+    private Uni<GetServiceRegistrationResponse> loadServiceRegistration(String moduleName) {
+        return grpcClientFactory.getClient(moduleName, MutinyPipeStepProcessorServiceGrpc::newMutinyStub)
+            .flatMap(stub -> stub.getServiceRegistration(GetServiceRegistrationRequest.getDefaultInstance()));
+    }
+
+    private Uni<RunModuleTestRequest> validateRequest(RunModuleTestRequest request) {
+        if (request == null || request.getModuleName() == null || request.getModuleName().isBlank()) {
+            return Uni.createFrom().failure(new IllegalArgumentException("module_name is required"));
+        }
+
+        if (request.getInputCase() == RunModuleTestRequest.InputCase.INPUT_NOT_SET) {
+            return Uni.createFrom().failure(new IllegalArgumentException("input source is required"));
+        }
+
+        return Uni.createFrom().item(request);
+    }
+
+    private Uni<Void> validateUploadCapability(RunModuleTestRequest request) {
+        if (request.getInputCase() != RunModuleTestRequest.InputCase.UPLOAD) {
+            return Uni.createFrom().item(null);
+        }
+
+        return loadServiceRegistration(request.getModuleName())
+            .onItem().invoke(registration -> {
+                if (!isParserModule(registration)) {
+                    throw new IllegalArgumentException("Upload input is only supported for parser modules");
+                }
+            })
+            .replaceWithVoid();
+    }
+
+    private Uni<PipeDoc> resolveInputDocument(RunModuleTestRequest request) {
+        if (request.getInputCase() == RunModuleTestRequest.InputCase.UPLOAD) {
+            return buildDocumentFromUpload(request.getUpload());
+        }
+
+        if (request.getInputCase() == RunModuleTestRequest.InputCase.REPOSITORY) {
+            return loadDocumentFromRepository(request.getRepository());
+        }
+
+        return Uni.createFrom().failure(new IllegalArgumentException("unsupported input source"));
+    }
+
+    private Uni<PipeDoc> buildDocumentFromUpload(UploadInput upload) {
+        if (upload == null) {
+            return Uni.createFrom().failure(new IllegalArgumentException("upload payload is required"));
+        }
+        if (upload.getFileData().isEmpty()) {
+            return Uni.createFrom().failure(new IllegalArgumentException("upload file is empty"));
+        }
+
+        return Uni.createFrom().item(() -> {
+            SearchMetadata searchMetadata = SearchMetadata.newBuilder()
+                .setTitle(upload.getFilename().isBlank() ? "test-upload" : upload.getFilename())
+                .setSourceMimeType(upload.getMimeType())
+                .build();
+
+            Blob blob = Blob.newBuilder()
+                .setBlobId(UUID.randomUUID().toString())
+                .setData(upload.getFileData())
+                .setMimeType(upload.getMimeType())
+                .setFilename(upload.getFilename())
+                .setSizeBytes(upload.getFileData().size())
+                .build();
+
+            return PipeDoc.newBuilder()
+                .setDocId(UUID.randomUUID().toString())
+                .setSearchMetadata(searchMetadata)
+                .setBlobBag(BlobBag.newBuilder().setBlob(blob))
+                .build();
+        });
+    }
+
+    private Uni<PipeDoc> loadDocumentFromRepository(RepositoryInput repositoryInput) {
+        String repositoryNodeId = repositoryInput.getRepositoryNodeId();
+        if (repositoryNodeId == null || repositoryNodeId.isBlank()) {
+            return Uni.createFrom().failure(new IllegalArgumentException("repository_node_id is required"));
+        }
+
+        return grpcClientFactory.getClient(repositoryServiceName, MutinyPipeDocServiceGrpc::newMutinyStub)
+            .flatMap(stub -> stub.getPipeDoc(GetPipeDocRequest.newBuilder()
+                .setNodeId(repositoryNodeId)
+                .build()))
+            .map(GetPipeDocResponse::getPipedoc)
+            .flatMap(doc -> hydrateBlobFromStorageIfNeeded(doc, repositoryInput.getHydrateBlobFromStorage()));
+    }
+
+    private Uni<PipeDoc> hydrateBlobFromStorageIfNeeded(PipeDoc document, boolean hydrate) {
+        if (document == null || !document.hasBlobBag() || !hydrate) {
+            return Uni.createFrom().item(document);
+        }
+
+        BlobBag blobBag = document.getBlobBag();
+        if (blobBag.getBlobDataCase() != BlobBag.BlobDataCase.BLOB) {
+            return Uni.createFrom().item(document);
+        }
+
+        Blob blob = blobBag.getBlob();
+        if (blob.getContentCase() != Blob.ContentCase.STORAGE_REF) {
+            return Uni.createFrom().item(document);
+        }
+
+        return grpcClientFactory.getClient(repositoryServiceName, MutinyPipeDocServiceGrpc::newMutinyStub)
+            .flatMap(stub -> stub.getBlob(GetBlobRequest.newBuilder()
+                .setStorageRef(blob.getStorageRef())
+                .build()))
+            .map((GetBlobResponse response) -> {
+                Blob hydratedBlob = blob.toBuilder()
+                    .clearContent()
+                    .setData(response.getData())
+                    .setSizeBytes(response.getSizeBytes())
+                    .build();
+
+                if (response.hasMimeType()) {
+                    hydratedBlob = hydratedBlob.toBuilder()
+                        .setMimeType(response.getMimeType())
+                        .build();
+                }
+
+                return document.toBuilder()
+                    .setBlobBag(BlobBag.newBuilder().setBlob(hydratedBlob))
+                    .build();
+            });
+    }
+
+    private Uni<ProcessDataResponse> executeModuleCall(RunModuleTestRequest request, PipeDoc document) {
+        ProcessDataRequest processDataRequest = ProcessDataRequest.newBuilder()
+            .setDocument(document)
+            .setMetadata(buildServiceMetadata(request))
+            .setConfig(ProcessConfiguration.newBuilder().setJsonConfig(request.getModuleConfig()))
+            .setIsTest(true)
+            .build();
+
+        return grpcClientFactory.getClient(request.getModuleName(), MutinyPipeStepProcessorServiceGrpc::newMutinyStub)
+            .flatMap(stub -> stub.processData(processDataRequest));
+    }
+
+    private ServiceMetadata buildServiceMetadata(RunModuleTestRequest request) {
+        ServiceContext context = request.hasContext()
+            ? request.getContext()
+            : ServiceContext.getDefaultInstance();
+
+        return ServiceMetadata.newBuilder()
+            .setPipelineName(resolveText(context.getPipelineName(), defaultPipelineName))
+            .setPipeStepName(resolveText(context.getPipeStepName(), defaultStepName))
+            .setStreamId(resolveText(context.getStreamId(), UUID.randomUUID().toString()))
+            .setCurrentHopNumber(context.getCurrentHopNumber() <= 0 ? 1 : context.getCurrentHopNumber())
+            .putAllContextParams(context.getContextParamsMap())
+            .build();
+    }
+
+    private RunModuleTestResponse buildRunResponse(
+            RunModuleTestRequest request,
+            ProcessDataResponse processResponse,
+            long startedAtMs,
+            Timestamp startedAt
+    ) {
+        long completedAtMs = System.currentTimeMillis();
+        long durationMs = Math.max(1L, completedAtMs - startedAtMs);
+
+        RunModuleTestResponse.Builder responseBuilder = RunModuleTestResponse.newBuilder()
+            .setSuccess(processResponse.getSuccess())
+            .setMessage(processResponse.getSuccess() ? "Module execution completed" : "Module execution failed")
+            .setDurationMs(durationMs)
+            .setElapsedMs(durationMs)
+            .setStartedAt(startedAt)
+            .setCompletedAt(toTimestamp(completedAtMs))
+            .addAllProcessorLogs(processResponse.getProcessorLogsList())
+            .setInputSummary(buildInputSummary(request))
+            .setOutputSummary(buildOutputSummary(processResponse));
+
+        if (request.getIncludeOutputDoc() && processResponse.hasOutputDoc()) {
+            responseBuilder.setOutputDoc(processResponse.getOutputDoc());
+        }
+        if (!processResponse.getSuccess()) {
+            responseBuilder.setErrorCode("PROCESS_DATA_ERROR");
+        }
+
+        responseBuilder.setProcessDataResponse(processResponse);
+
+        if (processResponse.hasErrorDetails()) {
+            responseBuilder.addErrors(processResponse.getErrorDetails().toString());
+        }
+
+        return responseBuilder.build();
+    }
+
+    private RunModuleTestResponse buildRunResponseFromFailure(
+            String moduleName,
+            Throwable throwable,
+            long startedAtMs,
+            Timestamp startedAt
+    ) {
+        LOG.errorf(throwable, "Failed module test for module=%s", moduleName);
+
+        long completedAtMs = System.currentTimeMillis();
+        long durationMs = Math.max(1L, completedAtMs - startedAtMs);
+
+        return RunModuleTestResponse.newBuilder()
+            .setSuccess(false)
+            .setMessage(resolveText(throwable.getMessage(), "module execution failed"))
+            .setDurationMs(durationMs)
+            .setElapsedMs(durationMs)
+            .setErrorCode(throwable.getClass().getSimpleName())
+            .addErrors(resolveText(throwable.getMessage(), "error while executing module"))
+            .setStartedAt(startedAt)
+            .setCompletedAt(toTimestamp(completedAtMs))
+            .build();
+    }
+
+    private Uni<ModuleTestingSidecarModels.ModuleTargetInfo> resolveModuleTarget(GetModuleResponse module) {
+        return loadServiceRegistration(module.getModuleName())
+            .map(registration -> toModuleTargetInfo(module, registration))
+            .onFailure().recoverWithItem(failure -> toUnavailableModuleTarget(module, failure.getMessage()));
+    }
+
+    private ModuleTestingSidecarModels.ModuleTargetInfo toUnavailableModuleTarget(
+            GetModuleResponse module,
+            String registrationError
+    ) {
+        return new ModuleTestingSidecarModels.ModuleTargetInfo(
+            module.getModuleName(),
+            module.getServiceId(),
+            module.getVersion(),
+            module.getHost(),
+            module.getPort(),
+            module.getInputFormat(),
+            module.getOutputFormat(),
+            module.getDocumentTypesList(),
+            List.of(),
+            false,
+            false,
+            "",
+            "",
+            "",
+            module.getIsHealthy(),
+            registrationError == null ? "" : registrationError
+        );
+    }
+
+    private ModuleTestingSidecarModels.ModuleTargetInfo toModuleTargetInfo(
+            GetModuleResponse module,
+            GetServiceRegistrationResponse registration
+    ) {
+        List<String> capabilities = registration.hasCapabilities()
+            ? registration.getCapabilities().getTypesList().stream().map(Enum::name).toList()
+            : List.of();
+
+        boolean parser = registration.hasCapabilities() && registration.getCapabilities().getTypesList().stream()
+            .anyMatch(CapabilityType.CAPABILITY_TYPE_PARSER::equals);
+        boolean sink = registration.hasCapabilities() && registration.getCapabilities().getTypesList().stream()
+            .anyMatch(CapabilityType.CAPABILITY_TYPE_SINK::equals);
+
+        return new ModuleTestingSidecarModels.ModuleTargetInfo(
+            module.getModuleName(),
+            module.getServiceId(),
+            module.getVersion(),
+            module.getHost(),
+            module.getPort(),
+            module.getInputFormat(),
+            module.getOutputFormat(),
+            module.getDocumentTypesList(),
+            capabilities,
+            parser,
+            sink,
+            registration.getJsonConfigSchema(),
+            registration.getDisplayName(),
+            registration.getDescription(),
+            module.getIsHealthy(),
+            ""
+        );
+    }
+
+    private ModuleTestingSidecarModels.RepositoryDocumentsPage toRepositoryDocumentsPage(ListPipeDocsResponse response) {
+        List<ModuleTestingSidecarModels.RepositoryDocumentInfo> documents = response.getPipedocsList()
+            .stream()
+            .map(this::toRepositoryDocumentInfo)
+            .toList();
+
+        return new ModuleTestingSidecarModels.RepositoryDocumentsPage(
+            documents,
+            response.getNextContinuationToken(),
+            response.getTotalCount()
+        );
+    }
+
+    private ModuleTestingSidecarModels.RepositoryDocumentInfo toRepositoryDocumentInfo(PipeDocMetadata documentMetadata) {
+        return new ModuleTestingSidecarModels.RepositoryDocumentInfo(
+            documentMetadata.getNodeId(),
+            documentMetadata.getDocId(),
+            documentMetadata.getTitle(),
+            documentMetadata.getDocumentType(),
+            documentMetadata.getSizeBytes(),
+            documentMetadata.getDrive(),
+            documentMetadata.getConnectorId(),
+            documentMetadata.getCreatedAtEpochMs()
+        );
+    }
+
+    private Struct buildInputSummary(RunModuleTestRequest request) {
+        Struct.Builder summary = Struct.newBuilder()
+            .putFields("moduleName", Value.newBuilder().setStringValue(request.getModuleName()).build())
+            .putFields("includeOutputDoc", Value.newBuilder().setBoolValue(request.getIncludeOutputDoc()).build())
+            .putFields("accountId", Value.newBuilder().setStringValue(resolveText(request.getAccountId(), "unknown")).build())
+            .putFields("inputSource", Value.newBuilder().setStringValue(request.getInputCase().name()).build());
+
+        ServiceContext context = request.hasContext() ? request.getContext() : ServiceContext.getDefaultInstance();
+        summary.putFields("pipelineName", Value.newBuilder().setStringValue(context.getPipelineName()).build());
+        summary.putFields("pipeStepName", Value.newBuilder().setStringValue(context.getPipeStepName()).build());
+        summary.putFields("streamId", Value.newBuilder().setStringValue(context.getStreamId()).build());
+        summary.putFields("currentHopNumber", Value.newBuilder().setNumberValue(context.getCurrentHopNumber()).build());
+
+        if (request.getInputCase() == RunModuleTestRequest.InputCase.UPLOAD) {
+            summary.putFields("uploadFileName", Value.newBuilder().setStringValue(request.getUpload().getFilename()).build());
+            summary.putFields("uploadMimeType", Value.newBuilder().setStringValue(request.getUpload().getMimeType()).build());
+            summary.putFields("uploadBytes", Value.newBuilder().setNumberValue(request.getUpload().getFileData().size()).build());
+        } else if (request.getInputCase() == RunModuleTestRequest.InputCase.REPOSITORY) {
+            summary.putFields("repositoryNodeId",
+                Value.newBuilder().setStringValue(request.getRepository().getRepositoryNodeId()).build());
+            summary.putFields("repositoryDrive",
+                Value.newBuilder().setStringValue(request.getRepository().getDrive()).build());
+            summary.putFields("repositoryHydration",
+                Value.newBuilder().setBoolValue(request.getRepository().getHydrateBlobFromStorage()).build());
+        }
+
+        return summary.build();
+    }
+
+    private Struct buildOutputSummary(ProcessDataResponse processResponse) {
+        Struct.Builder summary = Struct.newBuilder()
+            .putFields("success", Value.newBuilder().setBoolValue(processResponse.getSuccess()).build())
+            .putFields("processorLogCount",
+                Value.newBuilder().setNumberValue(processResponse.getProcessorLogsCount()).build());
+
+        if (processResponse.hasOutputDoc()) {
+            summary.putFields("outputDocId",
+                Value.newBuilder().setStringValue(processResponse.getOutputDoc().getDocId()).build());
+            summary.putFields("outputTitle", Value.newBuilder()
+                .setStringValue(processResponse.getOutputDoc().getSearchMetadata().getTitle())
+                .build());
+        }
+
+        if (processResponse.hasErrorDetails()) {
+            summary.putFields("errorDetails", Value.newBuilder().setStructValue(processResponse.getErrorDetails()).build());
+        }
+
+        return summary.build();
+    }
+
+    private boolean isParserModule(GetServiceRegistrationResponse registration) {
+        if (!registration.hasCapabilities()) {
+            return false;
+        }
+
+        return registration.getCapabilities().getTypesList().stream().anyMatch(PARSER_CAPABILITIES::contains);
+    }
+
+    private String resolveText(String value, String fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        return value;
+    }
+
+    private Timestamp toTimestamp(long epochMs) {
+        Instant instant = Instant.ofEpochMilli(epochMs);
+        return Timestamp.newBuilder()
+            .setSeconds(instant.getEpochSecond())
+            .setNanos(instant.getNano())
+            .build();
+    }
+}

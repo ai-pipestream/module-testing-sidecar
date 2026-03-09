@@ -7,7 +7,8 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import ai.pipestream.data.v1.PipeDoc;
 import ai.pipestream.data.v1.SearchMetadata;
-import ai.pipestream.data.module.*;
+import ai.pipestream.data.v1.ProcessConfiguration;
+import ai.pipestream.data.module.v1.*;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Uni;
 import jakarta.inject.Inject;
@@ -21,7 +22,7 @@ import org.jboss.logging.Logger;
  */
 @Singleton
 @GrpcService
-public class TestProcessorServiceImpl implements PipeStepProcessor {
+public class TestProcessorServiceImpl implements PipeStepProcessorService {
 
     private static final Logger LOG = Logger.getLogger(TestProcessorServiceImpl.class);
 
@@ -37,24 +38,11 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
     @Inject
     MeterRegistry registry;
 
-    /**
-     * Sets the processing delay in milliseconds.
-     * Used for simulating slow processing scenarios.
-     * 
-     * @param delayMs The delay in milliseconds
-     */
     public void setProcessingDelayMs(long delayMs) {
         this.processingDelayMs = delayMs;
         LOG.infof("Processing delay set to %d ms", delayMs);
     }
 
-    /**
-     * Sets the random failure rate (0.0 - 1.0).
-     * Used for simulating random failures.
-     * Note: This can also be set via configuration property test.processor.failure.rate
-     * 
-     * @param rate The failure rate (0.0 - 1.0)
-     */
     public void setRandomFailureRate(double rate) {
         if (rate < 0.0 || rate > 1.0) {
             throw new IllegalArgumentException("Failure rate must be between 0.0 and 1.0");
@@ -69,15 +57,14 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
 
     @jakarta.annotation.PostConstruct
     void init() {
-        // Validate configuration
         if (randomFailureRate < 0.0 || randomFailureRate > 1.0) {
             throw new IllegalArgumentException("test.processor.failure.rate must be between 0.0 and 1.0, got: " + randomFailureRate);
         }
-        
+
         if (randomFailureRate > 0.0) {
             LOG.infof("Test processor configured with random failure rate: %.2f", randomFailureRate);
         }
-        
+
         this.processedDocuments = Counter.builder("test.processor.documents.processed")
                 .description("Number of documents processed")
                 .register(registry);
@@ -92,11 +79,11 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
     }
 
     @Override
-    public Uni<ModuleProcessResponse> processData(ModuleProcessRequest request) {
+    public Uni<ProcessDataResponse> processData(ProcessDataRequest request) {
         return processingTimer.record(() -> processDataInternal(request));
     }
 
-    private Uni<ModuleProcessResponse> processDataInternal(ModuleProcessRequest request) {
+    Uni<ProcessDataResponse> processDataInternal(ProcessDataRequest request) {
         LOG.infof("TestProcessor received request for document: %s",
                 request.hasDocument() ? request.getDocument().getDocId() : "no-document");
 
@@ -106,9 +93,7 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
             if (random < randomFailureRate) {
                 LOG.infof("Simulating random failure (random=%.2f, threshold=%.2f)", random, randomFailureRate);
 
-                // Return a failure response instead of throwing an exception
-                // This ensures the failure is properly counted by the test
-                ModuleProcessResponse errorResponse = ModuleProcessResponse.newBuilder()
+                ProcessDataResponse errorResponse = ProcessDataResponse.newBuilder()
                         .setSuccess(false)
                         .addProcessorLogs("TestProcessor: Simulated random failure")
                         .setErrorDetails(Struct.newBuilder()
@@ -121,22 +106,20 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
             }
         }
 
-        // Add artificial delay if configured (for testing timeouts, etc.)
+        // Add artificial delay if configured
         Uni<Void> delay = processingDelayMs > 0
                 ? Uni.createFrom().<Void>nullItem().onItem().delayIt().by(java.time.Duration.ofMillis(processingDelayMs))
                 : Uni.createFrom().voidItem();
 
         return delay.onItem().transformToUni(v -> {
             try {
-                ModuleProcessResponse.Builder responseBuilder = ModuleProcessResponse.newBuilder()
+                ProcessDataResponse.Builder responseBuilder = ProcessDataResponse.newBuilder()
                         .setSuccess(true)
                         .addProcessorLogs("TestProcessor: Starting document processing");
 
                 if (request.hasDocument()) {
-                    // Process the document
                     PipeDoc doc = request.getDocument();
 
-                    // Log metadata if present
                     if (request.hasMetadata()) {
                         LOG.debugf("Processing document from pipeline: %s, step: %s, hop: %d",
                                 request.getMetadata().getPipelineName(),
@@ -144,7 +127,6 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
                                 request.getMetadata().getCurrentHopNumber());
                     }
 
-                    // Create or update custom_data with processing metadata
                     Struct.Builder customDataBuilder = doc.getSearchMetadata().hasCustomFields()
                             ? doc.getSearchMetadata().getCustomFields().toBuilder()
                             : Struct.newBuilder();
@@ -154,20 +136,18 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
                             .putFields("processing_timestamp", Value.newBuilder().setStringValue(String.valueOf(System.currentTimeMillis())).build())
                             .putFields("test_module_version", Value.newBuilder().setStringValue("1.0.0").build());
 
-                    // Add config params if present
                     if (request.hasConfig() && request.getConfig().getConfigParamsCount() > 0) {
                         request.getConfig().getConfigParamsMap().forEach((key, value) ->
                                 customDataBuilder.putFields("config_" + key, Value.newBuilder().setStringValue(value).build())
                         );
                     }
 
-                    // Check mode from config
                     String mode = "test";
                     boolean requireSchema = false;
                     boolean simulateError = false;
 
-                    if (request.hasConfig() && request.getConfig().hasCustomJsonConfig()) {
-                        Struct config = request.getConfig().getCustomJsonConfig();
+                    if (request.hasConfig() && request.getConfig().hasJsonConfig()) {
+                        Struct config = request.getConfig().getJsonConfig();
                         if (config.containsFields("mode")) {
                             mode = config.getFieldsMap().get("mode").getStringValue();
                         }
@@ -179,14 +159,11 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
                         }
                     }
 
-                    // Simulate error if requested
                     if (simulateError) {
                         throw new RuntimeException("Simulated error for testing");
                     }
 
-                    // Schema validation mode
                     if (mode.equals("validate") || requireSchema) {
-                        // Check if document has required fields for schema validation
                         if (!doc.getSearchMetadata().hasTitle() || doc.getSearchMetadata().getTitle().isEmpty()) {
                             throw new IllegalArgumentException("Schema validation failed: title is required");
                         }
@@ -211,7 +188,7 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
                     responseBuilder.addProcessorLogs("TestProcessor: No document provided");
                 }
 
-                ModuleProcessResponse response = responseBuilder.build();
+                ProcessDataResponse response = responseBuilder.build();
                 LOG.infof("TestProcessor returning success: %s", response.getSuccess());
 
                 return Uni.createFrom().item(response);
@@ -220,7 +197,7 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
                 LOG.errorf(e, "Error in TestProcessor");
                 failedDocuments.increment();
 
-                ModuleProcessResponse errorResponse = ModuleProcessResponse.newBuilder()
+                ProcessDataResponse errorResponse = ProcessDataResponse.newBuilder()
                         .setSuccess(false)
                         .addProcessorLogs("TestProcessor: Error - " + e.getMessage())
                         .setErrorDetails(Struct.newBuilder()
@@ -235,57 +212,12 @@ public class TestProcessorServiceImpl implements PipeStepProcessor {
     }
 
     @Override
-    public Uni<ServiceRegistrationMetadata> getServiceRegistration(RegistrationRequest request) {
+    public Uni<GetServiceRegistrationResponse> getServiceRegistration(GetServiceRegistrationRequest request) {
         LOG.debugf("TestProcessor registration requested");
 
-        // Using declarative registration via application.properties instead
-        return Uni.createFrom().item(ServiceRegistrationMetadata.newBuilder()
+        return Uni.createFrom().item(GetServiceRegistrationResponse.newBuilder()
                 .setModuleName("test-processor")
                 .setVersion("1.0.0")
                 .build());
-    }
-
-
-    @Override
-    public Uni<ModuleProcessResponse> testProcessData(ModuleProcessRequest request) {
-        LOG.info("TestProcessData called - executing test version of processing");
-
-        // For test processing, create a test document if none provided
-        if (request == null || !request.hasDocument()) {
-            PipeDoc testDoc = PipeDoc.newBuilder()
-                    .setDocId("test-doc-" + System.currentTimeMillis())
-                    .setSearchMetadata(SearchMetadata.newBuilder()
-                            .setTitle("Test Document")
-                            .setBody("This is a test document for validation")
-                            .build())
-                    .build();
-
-            ServiceMetadata testMetadata = ServiceMetadata.newBuilder()
-                    .setStreamId("test-stream")
-                    .setPipeStepName("test-step")
-                    .setPipelineName("test-pipeline")
-                    .build();
-
-            ProcessConfiguration testConfig = ProcessConfiguration.newBuilder()
-                    .build();
-
-            request = ModuleProcessRequest.newBuilder()
-                    .setDocument(testDoc)
-                    .setMetadata(testMetadata)
-                    .setConfig(testConfig)
-                    .build();
-        }
-
-        // Process normally but with test flag in logs
-        return processDataInternal(request)
-                .onItem().transform(response -> {
-                    // Add test marker to logs
-                    ModuleProcessResponse.Builder builder = response.toBuilder();
-                    for (int i = 0; i < builder.getProcessorLogsCount(); i++) {
-                        builder.setProcessorLogs(i, "[TEST] " + builder.getProcessorLogs(i));
-                    }
-                    builder.addProcessorLogs("[TEST] Test validation completed successfully");
-                    return builder.build();
-                });
     }
 }
