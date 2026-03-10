@@ -24,7 +24,7 @@ jobs:
     with:
       release_type: ${{ inputs.release_type }}
       custom_version: ${{ inputs.custom_version }}
-      docker-image-name: module-pipeline-probe
-      maven-artifact-id: module-pipeline-probe
+      docker-image-name: module-testing-sidecar
+      maven-artifact-id: module-testing-sidecar
       dockerfile-path: src/main/docker/Dockerfile.jvm
     secrets: inherit

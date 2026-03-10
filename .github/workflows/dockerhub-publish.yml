@@ -8,11 +8,11 @@ on:
       base_image:
         description: 'Base GHCR image'
         required: true
-        default: 'ghcr.io/ai-pipestream/module-pipeline-probe'
+        default: 'ghcr.io/ai-pipestream/module-testing-sidecar'
       dockerhub_repo:
         description: 'Docker Hub repository'
         required: true
-        default: 'pipestreamai/module-pipeline-probe'
+        default: 'pipestreamai/module-testing-sidecar'
       tags:
         description: 'Space-separated tags'
         required: true
