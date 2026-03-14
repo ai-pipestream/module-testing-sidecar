@@ -2,7 +2,7 @@
   <main class="container">
     <header class="topbar">
       <h1>Module Testing Sidecar</h1>
-      <p>Run module-specific tests from a registered module list. Parser modules can use file uploads; all modules can use repository documents.</p>
+      <p>Run module-specific tests from a registered module list. Choose from bundled sample documents, file uploads, or repository documents.</p>
     </header>
 
     <section class="card">
@@ -34,21 +34,22 @@
     <section class="card" v-if="selectedTarget">
       <h2>2) Choose input</h2>
 
-      <div v-if="selectedTarget.parser" class="mode-switch">
-        <label>
+      <div class="mode-switch">
+        <label v-if="selectedTarget.parser">
           <input type="radio" value="upload" v-model="inputMode" />
-          Upload file (parser mode)
+          Upload file
+        </label>
+        <label>
+          <input type="radio" value="sample" v-model="inputMode" />
+          Sample document
         </label>
         <label>
           <input type="radio" value="repository" v-model="inputMode" />
           Repository document
         </label>
       </div>
-      <p v-else class="mode-note">
-        Non-parser modules use repository documents only.
-      </p>
 
-      <div v-if="showUploadInput" class="row">
+      <div v-if="inputMode === 'upload' && selectedTarget.parser" class="row">
         <label for="input-file">Input file</label>
         <input
           id="input-file"
@@ -58,13 +59,30 @@
         <p v-if="selectedFile">Selected: {{ selectedFile.name }}</p>
       </div>
 
-      <div class="row">
+      <div v-if="inputMode === 'sample'" class="row">
+        <label for="sample-doc-select">Sample document</label>
+        <select
+          id="sample-doc-select"
+          v-model="selectedSampleId"
+        >
+          <option value="" disabled>Choose a sample file</option>
+          <option
+            v-for="sample in sampleDocuments"
+            :key="sample.id"
+            :value="sample.id"
+          >
+            {{ sample.title }} ({{ sample.mimeType.split('/')[1] }}) -- {{ formatBytes(sample.sizeBytes) }}
+          </option>
+        </select>
+        <p v-if="selectedSampleInfo" class="muted">{{ selectedSampleInfo.description }}</p>
+      </div>
+
+      <div v-if="inputMode === 'repository'" class="row">
         <label for="repository-doc-select">Repository document</label>
         <select
           id="repository-doc-select"
           v-model="selectedRepositoryNodeId"
           @change="onRepositoryDocumentChanged"
-          :disabled="showUploadInput && Boolean(selectedFile)"
         >
           <option value="" disabled>Choose document</option>
           <option
@@ -164,7 +182,9 @@ const sortedRepositoryDocuments = computed(() =>
   [...repositoryDocuments.value].sort((a, b) => (a.label || '').localeCompare(b.label || ''))
 )
 const selectedRepositoryNodeId = ref('')
-const inputMode = ref('upload')
+const sampleDocuments = ref([])
+const selectedSampleId = ref('')
+const inputMode = ref('sample')
 const selectedFile = ref(null)
 const moduleConfigText = ref('{}')
 const running = ref(false)
@@ -176,8 +196,8 @@ const statusMessage = ref('')
 const jsonDepth = ref(3)
 const copyLabel = ref('Copy JSON')
 
-const showUploadInput = computed(() =>
-  Boolean(selectedTarget.value?.parser && inputMode.value === 'upload')
+const selectedSampleInfo = computed(() =>
+  sampleDocuments.value.find((s) => s.id === selectedSampleId.value) || null
 )
 
 const canRun = computed(() => {
@@ -185,21 +205,20 @@ const canRun = computed(() => {
     return false
   }
 
-  if (selectedTarget.value.parser) {
-    if (inputMode.value === 'upload') {
-      return Boolean(selectedFile.value)
-    }
+  if (inputMode.value === 'upload') {
+    return Boolean(selectedFile.value)
+  }
+  if (inputMode.value === 'sample') {
+    return Boolean(selectedSampleId.value)
+  }
+  if (inputMode.value === 'repository') {
+    return Boolean(selectedRepositoryNodeId.value)
   }
 
-  return Boolean(selectedRepositoryNodeId.value)
+  return false
 })
 
-const effectiveMode = computed(() => {
-  if (selectedTarget.value?.parser) {
-    return inputMode.value
-  }
-  return 'repository'
-})
+const effectiveMode = computed(() => inputMode.value)
 
 const resultSummary = computed(() => {
   const r = runResult.value
@@ -233,21 +252,26 @@ const copyResult = async () => {
   }
 }
 
-const deriveDefaultConfigFromSchema = (schema, current) => {
-  let result = {}
-  if (current && Object.keys(current).length > 0) {
-    result = { ...current }
-  }
-  if (!schema || typeof schema !== 'object' || schema.type !== 'object' || !schema.properties) {
-    return result
+const deriveDefaultConfigFromSchema = (schema) => {
+  if (!schema || typeof schema !== 'object' || schema.type !== 'object') {
+    return {}
   }
 
-  Object.entries(schema.properties).forEach(([key, value]) => {
-    if (result[key] !== undefined) {
-      return
-    }
-    if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'default')) {
-      result[key] = value.default
+  if (schema.examples && Array.isArray(schema.examples) && schema.examples.length > 0) {
+    return { ...schema.examples[0] }
+  }
+
+  if (!schema.properties) {
+    return {}
+  }
+
+  const result = {}
+  Object.entries(schema.properties).forEach(([key, prop]) => {
+    if (!prop || typeof prop !== 'object') return
+    if (Object.prototype.hasOwnProperty.call(prop, 'default')) {
+      result[key] = prop.default
+    } else if (prop.examples && Array.isArray(prop.examples) && prop.examples.length > 0) {
+      result[key] = prop.examples[0]
     }
   })
 
@@ -273,6 +297,18 @@ const loadTargets = async () => {
     error.value = e.message || 'Could not load modules'
   } finally {
     loadingTargets.value = false
+  }
+}
+
+const loadSamples = async () => {
+  try {
+    const response = await fetch(`${API_BASE}/samples`)
+    if (!response.ok) {
+      throw new Error(`Failed loading samples: HTTP ${response.status}`)
+    }
+    sampleDocuments.value = await response.json()
+  } catch (e) {
+    statusMessage.value = e.message || 'Failed to load sample documents'
   }
 }
 
@@ -318,29 +354,24 @@ const parseModuleConfig = () => {
 
 const applyTargetSchemaDefaults = (target) => {
   schemaError.value = ''
-  let schema = null
-  if (target?.jsonConfigSchema) {
-    try {
-      schema = JSON.parse(target.jsonConfigSchema)
-    } catch (_err) {
-      schemaError.value = 'Module schema is not valid JSON'
-    }
-  }
-  if (schema && schema.type === 'object') {
-    const currentConfig = parseModuleConfigSafe()
-    const merged = deriveDefaultConfigFromSchema(schema, currentConfig)
-    moduleConfigText.value = JSON.stringify(merged, null, 2)
-  } else if (moduleConfigText.value.trim() === '') {
+  if (!target?.jsonConfigSchema) {
     moduleConfigText.value = '{}'
+    return
   }
-}
 
-const parseModuleConfigSafe = () => {
+  let schema = null
   try {
-    return parseModuleConfig()
+    schema = JSON.parse(target.jsonConfigSchema)
   } catch (_err) {
-    return {}
+    schemaError.value = 'Module schema is not valid JSON'
+    moduleConfigText.value = '{}'
+    return
   }
+
+  const defaults = deriveDefaultConfigFromSchema(schema)
+  moduleConfigText.value = Object.keys(defaults).length > 0
+    ? JSON.stringify(defaults, null, 2)
+    : '{}'
 }
 
 const onModuleChanged = async () => {
@@ -352,13 +383,10 @@ const onModuleChanged = async () => {
     return
   }
 
-  if (selectedTarget.value.parser) {
-    inputMode.value = 'upload'
-  } else {
-    inputMode.value = 'repository'
-  }
+  inputMode.value = 'sample'
 
   selectedFile.value = null
+  selectedSampleId.value = ''
   selectedRepositoryNodeId.value = ''
   applyTargetSchemaDefaults(selectedTarget.value)
 }
@@ -422,33 +450,50 @@ const runTest = async () => {
         method: 'POST',
         body
       })
+    } else if (effectiveMode.value === 'sample') {
+      if (!selectedSampleId.value) {
+        throw new Error('Select a sample document first')
+      }
+
+      response = await fetch(`${API_BASE}/run/sample`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sampleId: selectedSampleId.value,
+          moduleName: commonRequest.moduleName,
+          moduleConfig: commonRequest.moduleConfig,
+          includeOutputDoc: commonRequest.includeOutputDoc,
+          accountId: commonRequest.accountId,
+          pipelineName: commonRequest.pipelineName,
+          pipeStepName: commonRequest.pipeStepName,
+          streamId: commonRequest.streamId,
+          currentHopNumber: commonRequest.currentHopNumber,
+          contextParams: {}
+        })
+      })
     } else {
       const doc = repositoryDocuments.value.find((item) => item.nodeId === selectedRepositoryNodeId.value)
       if (!doc) {
         throw new Error('Select a repository document first')
       }
 
-      const runRequest = {
-        moduleName: commonRequest.moduleName,
-        repositoryNodeId: doc.nodeId,
-        drive: doc.drive || '',
-        hydrateBlobFromStorage: false,
-        moduleConfig: commonRequest.moduleConfig,
-        includeOutputDoc: commonRequest.includeOutputDoc,
-        accountId: commonRequest.accountId,
-        pipelineName: commonRequest.pipelineName,
-        pipeStepName: commonRequest.pipeStepName,
-        streamId: commonRequest.streamId,
-        currentHopNumber: 1,
-        contextParams: {}
-      }
-
       response = await fetch(`${API_BASE}/run/repository`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(runRequest)
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          moduleName: commonRequest.moduleName,
+          repositoryNodeId: doc.nodeId,
+          drive: doc.drive || '',
+          hydrateBlobFromStorage: false,
+          moduleConfig: commonRequest.moduleConfig,
+          includeOutputDoc: commonRequest.includeOutputDoc,
+          accountId: commonRequest.accountId,
+          pipelineName: commonRequest.pipelineName,
+          pipeStepName: commonRequest.pipeStepName,
+          streamId: commonRequest.streamId,
+          currentHopNumber: 1,
+          contextParams: {}
+        })
       })
     }
 
@@ -503,6 +548,7 @@ const formatBytes = (bytes) => {
 onMounted(async () => {
   await Promise.all([
     loadTargets(),
+    loadSamples(),
     refreshRepositoryDocuments()
   ])
 })

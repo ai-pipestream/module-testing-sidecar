@@ -34,6 +34,7 @@ import org.jboss.resteasy.reactive.multipart.FileUpload;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -83,6 +84,23 @@ public class ModuleTestingSidecarResource {
             return Map.of("message", "No errors recorded");
         }
         return last.toMap();
+    }
+
+    @GET
+    @Path("/samples")
+    public List<Map<String, Object>> listSamples() {
+        return Arrays.stream(SampleDocument.values())
+                .map(SampleDocument::toInfo)
+                .toList();
+    }
+
+    @POST
+    @Path("/run/sample")
+    @Consumes(MediaType.APPLICATION_JSON)
+    public Uni<Response> runSample(RunSampleRequest request) {
+        return Uni.createFrom().item(() -> buildRunRequestFromSample(request))
+                .flatMap(testingService::runModuleTest)
+                .map(this::protobufToJsonResponse);
     }
 
     @POST
@@ -196,6 +214,42 @@ public class ModuleTestingSidecarResource {
                 .build();
     }
 
+    private RunModuleTestRequest buildRunRequestFromSample(RunSampleRequest request) {
+        if (request == null || request.moduleName() == null || request.moduleName().isBlank()) {
+            throw new IllegalArgumentException("moduleName is required");
+        }
+        if (request.sampleId() == null || request.sampleId().isBlank()) {
+            throw new IllegalArgumentException("sampleId is required");
+        }
+
+        SampleDocument sample = SampleDocument.fromId(request.sampleId());
+        byte[] fileBytes;
+        try {
+            fileBytes = sample.loadBytes();
+        } catch (IOException e) {
+            throw new IllegalArgumentException("Failed to load sample file: " + sample.getFileName(), e);
+        }
+
+        return RunModuleTestRequest.newBuilder()
+                .setModuleName(request.moduleName())
+                .setModuleConfig(parseStruct(request.moduleConfig()))
+                .setIncludeOutputDoc(request.includeOutputDoc())
+                .setAccountId(resolveText(request.accountId(), ""))
+                .setContext(buildContext(
+                        request.pipelineName(),
+                        request.pipeStepName(),
+                        request.streamId(),
+                        request.currentHopNumber(),
+                        request.contextParams()
+                ))
+                .setUpload(UploadInput.newBuilder()
+                        .setFilename(sample.getFileName())
+                        .setMimeType(sample.getMimeType())
+                        .setFileData(ByteString.copyFrom(fileBytes))
+                        .build())
+                .build();
+    }
+
     private ServiceContext buildContext(
             String pipelineName,
             String pipeStepName,
@@ -298,6 +352,20 @@ public class ModuleTestingSidecarResource {
             String repositoryNodeId,
             String drive,
             boolean hydrateBlobFromStorage,
+            String moduleConfig,
+            boolean includeOutputDoc,
+            String accountId,
+            String pipelineName,
+            String pipeStepName,
+            String streamId,
+            long currentHopNumber,
+            Map<String, String> contextParams
+    ) {
+    }
+
+    public record RunSampleRequest(
+            String sampleId,
+            String moduleName,
             String moduleConfig,
             boolean includeOutputDoc,
             String accountId,
