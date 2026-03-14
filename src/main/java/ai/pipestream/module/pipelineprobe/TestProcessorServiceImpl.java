@@ -211,13 +211,44 @@ public class TestProcessorServiceImpl implements PipeStepProcessorService {
         });
     }
 
+    private static final String JSON_CONFIG_SCHEMA = """
+            {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "title": "Test Processor Configuration",
+              "description": "Configuration for the built-in test processor module",
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "type": "string",
+                  "enum": ["test", "validate"],
+                  "default": "test",
+                  "description": "Processing mode. 'test' passes through with metadata; 'validate' checks title and body are present."
+                },
+                "requireSchema": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, enforces schema validation (title + body required) regardless of mode."
+                },
+                "simulateError": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, forces a simulated RuntimeException for error-handling tests."
+                }
+              },
+              "additionalProperties": false
+            }
+            """;
+
     @Override
     public Uni<GetServiceRegistrationResponse> getServiceRegistration(GetServiceRegistrationRequest request) {
         LOG.debugf("TestProcessor registration requested");
 
         return Uni.createFrom().item(GetServiceRegistrationResponse.newBuilder()
-                .setModuleName("test-processor")
+                .setModuleName("module-testing-sidecar")
+                .setDisplayName("Module Testing Sidecar (Test Processor)")
+                .setDescription("Built-in test processor that adds metadata to documents. Supports validation mode and simulated errors for testing.")
                 .setVersion("1.0.0")
+                .setJsonConfigSchema(JSON_CONFIG_SCHEMA)
                 .build());
     }
 }

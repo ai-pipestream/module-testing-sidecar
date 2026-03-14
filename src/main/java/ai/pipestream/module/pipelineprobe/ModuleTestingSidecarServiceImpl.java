@@ -160,7 +160,7 @@ public class ModuleTestingSidecarServiceImpl implements ModuleTestingSidecarServ
 
     private Uni<Void> validateUploadCapability(RunModuleTestRequest request) {
         if (request.getInputCase() != RunModuleTestRequest.InputCase.UPLOAD) {
-            return Uni.createFrom().item(null);
+            return Uni.createFrom().voidItem();
         }
 
         return loadServiceRegistration(request.getModuleName())

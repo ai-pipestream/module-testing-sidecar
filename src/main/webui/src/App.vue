@@ -100,7 +100,8 @@
         >
           {{ running ? 'Running...' : 'Run test' }}
         </button>
-        <button type="button" @click="clearRunResult" :disabled="!runResult">Clear result</button>
+        <button type="button" @click="clearRunResult" :disabled="!runResult && !runError">Clear result</button>
+        <button type="button" @click="fetchLastError" class="btn-secondary">View last server error</button>
       </div>
       <p v-if="runError" class="warning">{{ runError }}</p>
     </section>
@@ -409,7 +410,8 @@ const runTest = async () => {
     }
 
     if (!response.ok) {
-      throw new Error(parsed?.message || `HTTP ${response.status}`)
+      const errMsg = parsed?.message || parsed?.error || responseText || `HTTP ${response.status}`
+      throw new Error(errMsg)
     }
 
     runResult.value = parsed
@@ -423,6 +425,17 @@ const runTest = async () => {
 const clearRunResult = () => {
   runResult.value = null
   runError.value = ''
+}
+
+const fetchLastError = async () => {
+  try {
+    const response = await fetch(`${API_BASE}/debug/last-error`)
+    const json = await response.json()
+    runResult.value = json
+    runError.value = ''
+  } catch (e) {
+    runError.value = e.message || 'Failed to fetch last error'
+  }
 }
 
 const formatBytes = (bytes) => {
@@ -508,6 +521,11 @@ button {
 button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: #757575;
+  border-color: #757575;
 }
 
 .mode-switch {

@@ -2,13 +2,16 @@ package ai.pipestream.module.pipelineprobe;
 
 import ai.pipestream.testing.harness.v1.RepositoryInput;
 import ai.pipestream.testing.harness.v1.RunModuleTestRequest;
-import ai.pipestream.testing.harness.v1.RunModuleTestResponse;
 import ai.pipestream.testing.harness.v1.ServiceContext;
 import ai.pipestream.testing.harness.v1.UploadInput;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.protobuf.InvalidProtocolBufferException;
+import com.google.protobuf.MessageOrBuilder;
 import com.google.protobuf.Struct;
 import com.google.protobuf.Struct.Builder;
+import com.google.protobuf.TextFormat;
+import com.google.protobuf.TypeRegistry;
 import com.google.protobuf.util.JsonFormat;
 import com.google.protobuf.ByteString;
 import io.smallrye.mutiny.Uni;
@@ -48,6 +51,9 @@ public class ModuleTestingSidecarResource {
     @GrpcService
     ModuleTestingSidecarServiceImpl testingService;
 
+    @Inject
+    TypeRegistry typeRegistry;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @GET
@@ -69,17 +75,28 @@ public class ModuleTestingSidecarResource {
         return testingService.listRepositoryDocuments(drive, connectorId, limit, continuationToken);
     }
 
+    @GET
+    @Path("/debug/last-error")
+    public Map<String, Object> getLastError() {
+        var last = LastErrorTracker.get();
+        if (last == null) {
+            return Map.of("message", "No errors recorded");
+        }
+        return last.toMap();
+    }
+
     @POST
     @Path("/run/repository")
     @Consumes(MediaType.APPLICATION_JSON)
-    public Uni<RunModuleTestResponse> runRepository(RunRepositoryRequest request) {
-        return testingService.runModuleTest(buildRunRequestFromRepositoryRequest(request));
+    public Uni<Response> runRepository(RunRepositoryRequest request) {
+        return testingService.runModuleTest(buildRunRequestFromRepositoryRequest(request))
+                .map(this::protobufToJsonResponse);
     }
 
     @POST
     @Path("/run/upload")
     @Consumes(MediaType.MULTIPART_FORM_DATA)
-    public Uni<RunModuleTestResponse> runUpload(
+    public Uni<Response> runUpload(
             @RestForm("moduleName") String moduleName,
             @RestForm("accountId") String accountId,
             @RestForm("includeOutputDoc") @DefaultValue("false") boolean includeOutputDoc,
@@ -107,7 +124,8 @@ public class ModuleTestingSidecarResource {
                             fileBytes
                     );
                 })
-                .flatMap(testingService::runModuleTest);
+                .flatMap(testingService::runModuleTest)
+                .map(this::protobufToJsonResponse);
     }
 
     private RunModuleTestRequest buildRunRequestFromRepositoryRequest(RunRepositoryRequest request) {
@@ -243,6 +261,36 @@ public class ModuleTestingSidecarResource {
         return Response.status(Response.Status.BAD_REQUEST)
                 .entity(Map.of("error", e.getMessage()))
                 .build();
+    }
+
+    private Response protobufToJsonResponse(MessageOrBuilder message) {
+        try {
+            String json = JsonFormat.printer()
+                    .usingTypeRegistry(typeRegistry)
+                    .includingDefaultValueFields()
+                    .print(message);
+            return Response.ok(json, MediaType.APPLICATION_JSON).build();
+        } catch (InvalidProtocolBufferException e) {
+            LOG.warnf("TypeRegistry miss during JSON serialization, retrying without defaults: %s", e.getMessage());
+            try {
+                String json = JsonFormat.printer()
+                        .usingTypeRegistry(typeRegistry)
+                        .print(message);
+                return Response.ok(json, MediaType.APPLICATION_JSON).build();
+            } catch (Exception inner) {
+                LOG.warnf("JSON serialization still failed, falling back to TextFormat: %s", inner.getMessage());
+                String text = TextFormat.printer().printToString(message);
+                String fallback = "{\"_format\":\"protobuf-text\",\"data\":" +
+                        objectMapper.valueToTree(text) + "}";
+                return Response.ok(fallback, MediaType.APPLICATION_JSON).build();
+            }
+        } catch (Exception e) {
+            LOG.error("Failed to serialize protobuf response", e);
+            return Response.serverError()
+                    .entity(Map.of("error", "Failed to serialize response: " + e.getMessage()))
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+        }
     }
 
     public record RunRepositoryRequest(
