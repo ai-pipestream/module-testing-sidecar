@@ -106,15 +106,43 @@
       <p v-if="runError" class="warning">{{ runError }}</p>
     </section>
 
-    <section class="card" v-if="runResult">
-      <h2>Result</h2>
-      <pre>{{ formattedRunResult }}</pre>
+    <section class="card result-card" v-if="runResult">
+      <div class="result-header">
+        <h2>Result</h2>
+        <div class="result-actions">
+          <label class="depth-control">
+            Expand depth
+            <input type="number" v-model.number="jsonDepth" min="1" max="20" />
+          </label>
+          <button type="button" class="btn-small" @click="jsonDepth = 1">Collapse</button>
+          <button type="button" class="btn-small" @click="jsonDepth = 20">Expand all</button>
+          <button type="button" class="btn-small btn-secondary" @click="copyResult">{{ copyLabel }}</button>
+        </div>
+      </div>
+      <div v-if="resultSummary" class="result-summary">
+        <span v-for="(val, key) in resultSummary" :key="key" class="summary-chip">
+          <strong>{{ key }}:</strong> {{ val }}
+        </span>
+      </div>
+      <div class="json-viewer-wrap">
+        <VueJsonPretty
+          :data="runResult"
+          :deep="jsonDepth"
+          :showLength="true"
+          :showLine="false"
+          :showDoubleQuotes="true"
+          :showIcon="true"
+          :collapsedOnClickBrackets="true"
+        />
+      </div>
     </section>
   </main>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import VueJsonPretty from 'vue-json-pretty'
+import 'vue-json-pretty/lib/styles.css'
 
 const API_BASE = (() => {
   const path = window.location.pathname || '/'
@@ -145,6 +173,8 @@ const runError = ref('')
 const runResult = ref(null)
 const error = ref('')
 const statusMessage = ref('')
+const jsonDepth = ref(3)
+const copyLabel = ref('Copy JSON')
 
 const showUploadInput = computed(() =>
   Boolean(selectedTarget.value?.parser && inputMode.value === 'upload')
@@ -171,16 +201,37 @@ const effectiveMode = computed(() => {
   return 'repository'
 })
 
-const formattedRunResult = computed(() => {
-  if (!runResult.value) {
-    return ''
+const resultSummary = computed(() => {
+  const r = runResult.value
+  if (!r || typeof r !== 'object') return null
+  const summary = {}
+  if (r.success !== undefined) summary['Status'] = r.success ? 'Success' : 'Failed'
+  if (r.processingTimeMs ?? r.processing_time_ms)
+    summary['Time'] = `${r.processingTimeMs ?? r.processing_time_ms}ms`
+  if (r.moduleName ?? r.module_name)
+    summary['Module'] = r.moduleName ?? r.module_name
+  const outDoc = r.outputDoc ?? r.output_doc
+  if (outDoc) {
+    const title = outDoc.title || outDoc.docId || outDoc.doc_id || ''
+    if (title) summary['Doc'] = title
+    const metaCount = Object.keys(outDoc.metadata ?? outDoc.structured_data ?? {}).length
+    if (metaCount > 0) summary['Metadata fields'] = metaCount
   }
-  try {
-    return JSON.stringify(runResult.value, null, 2)
-  } catch (_err) {
-    return String(runResult.value)
-  }
+  if (r.error) summary['Error'] = r.error
+  return Object.keys(summary).length > 0 ? summary : null
 })
+
+const copyResult = async () => {
+  try {
+    const text = JSON.stringify(runResult.value, null, 2)
+    await navigator.clipboard.writeText(text)
+    copyLabel.value = 'Copied!'
+    setTimeout(() => { copyLabel.value = 'Copy JSON' }, 2000)
+  } catch (_e) {
+    copyLabel.value = 'Copy failed'
+    setTimeout(() => { copyLabel.value = 'Copy JSON' }, 2000)
+  }
+}
 
 const deriveDefaultConfigFromSchema = (schema, current) => {
   let result = {}
@@ -549,5 +600,82 @@ button:disabled {
 .muted {
   color: #5b5b5b;
   font-size: 13px;
+}
+
+.result-card {
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.result-header h2 {
+  margin: 0;
+}
+
+.result-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.depth-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.depth-control input {
+  width: 48px;
+  padding: 4px 6px;
+  border: 1px solid #b9b9b9;
+  border-radius: 4px;
+  font-size: 13px;
+  text-align: center;
+}
+
+.btn-small {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+.result-summary {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: #f0f4ff;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.summary-chip strong {
+  color: #3f51b5;
+}
+
+.json-viewer-wrap {
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 8px;
+  background: #fafafa;
+}
+
+.json-viewer-wrap :deep(.vjs-tree) {
+  font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 </style>
